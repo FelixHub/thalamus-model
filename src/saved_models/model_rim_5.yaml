@@ -1,0 +1,7 @@
+hidden_size: 64
+input_size: 53
+key_size: 2
+num_heads: 4
+num_mechanisms: 12
+output_size: 17
+rank: 2
