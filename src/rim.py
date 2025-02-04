@@ -263,7 +263,7 @@ class RIMNetwork_specialized(nn.Module):
     
 
 
-class RIMNetwork_mutliheads(nn.Module):
+class RIMNetwork_multHead(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, num_mechanisms=4,
                  key_size=16, rank=16, num_heads=1, task_size=0):
         super().__init__()
@@ -296,14 +296,14 @@ class RIMNetwork_mutliheads(nn.Module):
         self.W_V_comm = nn.Parameter(0.01 * torch.randn(num_heads, num_mechanisms, hidden_size, self.head_dim))
         
         # Linear transformation to combine head outputs
-        self.W_O = nn.Parameter(0.01 * torch.randn(num_mechanisms, num_heads * self.head_dim, hidden_size))
+        # self.W_O = nn.Parameter(0.01 * torch.randn(num_mechanisms, num_heads * self.head_dim, hidden_size))
 
         self.output_layer = nn.Linear(hidden_size * num_mechanisms, output_size)
         
     def init_hidden(self, batch_size, device):
         return torch.zeros(batch_size, self.num_mechanisms, self.hidden_size, device=device)
     
-    def rim_step(self, x, hidden_states=None, silence_attention=False):
+    def rim_step(self, x, hidden_states=None, silence_attention=False, smooth_attention_weights = None):
         X = x  # batch x input
         H = hidden_states  # batch x mechanism x hidden
 
@@ -327,35 +327,37 @@ class RIMNetwork_mutliheads(nn.Module):
             # Compute K, Q, V for current head
             K_comm = torch.einsum('bmh,mhk->bmk', H_in, self.W_K_comm[head])
             Q_comm = torch.einsum('bmh,mhk->bmk', H_in, self.W_Q_comm[head])
-            V_comm = torch.einsum('bmh,mhd->bmd', H_in, self.W_V_comm[head])  # d is head_dim
+            V_comm = torch.einsum('bmh,mhh->bmh', H_in, self.W_V_comm[head])
 
             # Compute attention weights
-            attention_weights = torch.nn.Softmax(dim=-1)(
+            attention_weights = torch.nn.Sigmoid()(                                                 # Softmax     or softplus?        
                 torch.einsum('bmk,bnk->bmn', Q_comm, K_comm)
-                / torch.sqrt(torch.tensor(self.key_size, dtype=torch.float32).to(x.device))
+                / ( torch.sqrt(torch.tensor(self.key_size, dtype=torch.float32).to(x.device)))
             )
+
+            if smooth_attention_weights is not None:
+                attention_weights = 0.5 * attention_weights + 0.5 * smooth_attention_weights[head]
             
             # Compute attention output for this head
-            A_comm_head = torch.einsum('bmn,bnd->bmd', attention_weights, V_comm)  # d is head_dim
+            A_comm_head = torch.einsum('bmn,bnh->bmh', attention_weights, V_comm)
             
             A_comm_heads.append(A_comm_head)
             attention_weights_heads.append(attention_weights)
         
-        # Concatenate heads along the hidden dimension
-        # [num_heads, batch, mechanisms, head_dim] -> [batch, mechanisms, num_heads * head_dim]
-        A_comm_concat = torch.cat(A_comm_heads, dim=-1)
+        # Sum attention outputs from all heads
+        A_comm = torch.stack(A_comm_heads).sum(dim=0)
+
+        attention_weights_heads = torch.stack(attention_weights_heads)
         
-        # Project concatenated heads back to hidden size for each mechanism
-        # [batch, mechanisms, num_heads * head_dim] * [mechanisms, num_heads * head_dim, hidden]
-        # -> [batch, mechanisms, hidden]
-        A_comm = torch.einsum('bmh,mhd->bmd', A_comm_concat, self.W_O)
-        
-        attention_weights = torch.stack(attention_weights_heads)  # Store all attention weights
-        
-        # Update hidden states with attention output
+        # Update hidden states with attention output +> wouldn't it make sense that it is the average of both? So that 
+        # when the main attention of a mechanism is on itself, the attention just act as the identity? It seems better somehow
+
+        # if A_comm_smooth is not None:
+        #     A_comm = 0.5 * A_comm + 0.5 * A_comm_smooth
+
         H_comm = H_in + A_comm
         
-        return H_comm, A_in, A_comm, attention_weights
+        return H_comm, A_in, A_comm, attention_weights_heads
 
     def forward(self, x, hidden_states=None, silence_attention=False):
         """
@@ -375,9 +377,11 @@ class RIMNetwork_mutliheads(nn.Module):
         attention_weights = []
         hidden_states_list = []
         
+        attn_weights = None
+
         for t in range(seq_len):
             hidden_states, attn_input, attn_comm, attn_weights = self.rim_step(
-                x[:, t], hidden_states, silence_attention
+                x[:, t], hidden_states, silence_attention,smooth_attention_weights=attn_weights
             )
             
             combined_hidden = hidden_states.reshape(batch_size, -1)
