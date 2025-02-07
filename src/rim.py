@@ -457,7 +457,7 @@ class RIMNetwork_specialized_multHead(nn.Module):
     def init_hidden(self, batch_size, device):
         return torch.zeros(batch_size, self.num_mechanisms, self.hidden_size, device=device)
     
-    def rim_step(self, x, hidden_states=None, silence_attention=False):
+    def rim_step(self, x, hidden_states=None, silence_attention=False,smooth_attention_weights=None):
         X = x  # batch x input
         H = hidden_states  # batch x mechanism x hidden
 
@@ -496,11 +496,14 @@ class RIMNetwork_specialized_multHead(nn.Module):
             V_comm = torch.einsum('bmh,mhh->bmh', H_in, self.W_V_comm[head])
 
             # Compute attention weights
-            attention_weights = torch.nn.Softmax(dim=-1)(
+            attention_weights = torch.nn.Sigmoid()(
                 torch.einsum('bmk,bnk->bmn', Q_comm, K_comm)
                 / torch.sqrt(torch.tensor(self.key_size, dtype=torch.float32).to(x.device))
             )
-            
+
+            if smooth_attention_weights is not None:
+                attention_weights = 0.5 * attention_weights + 0.5 * smooth_attention_weights[head]
+
             # Compute attention output for this head
             A_comm_head = torch.einsum('bmn,bnh->bmh', attention_weights, V_comm)
             
@@ -509,12 +512,12 @@ class RIMNetwork_specialized_multHead(nn.Module):
         
         # Sum attention outputs from all heads
         A_comm = torch.stack(A_comm_heads).sum(dim=0)
-        attention_weights = torch.stack(attention_weights_heads)
+        attention_weights_heads = torch.stack(attention_weights_heads)
         
         # Update hidden states with attention output
         H_comm = H_in + A_comm
         
-        return H_comm, A_in, A_comm, attention_weights
+        return H_comm, A_in, A_comm, attention_weights_heads
 
     def forward(self, x, hidden_states=None, silence_attention=False):
         batch_size, seq_len, _ = x.size()
@@ -529,9 +532,10 @@ class RIMNetwork_specialized_multHead(nn.Module):
         attention_weights = []
         hidden_states_list = []
         
+        attn_weights = None
         for t in range(seq_len):
             hidden_states, attn_input, attn_comm, attn_weights = self.rim_step(
-                x[:, t], hidden_states, silence_attention
+                x[:, t], hidden_states, silence_attention,smooth_attention_weights=attn_weights
             )
             
             # Only use the last third of mechanisms for output
